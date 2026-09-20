@@ -75,6 +75,8 @@ const createReact = () => {
         if (typeof cleanup === 'function') effectCleanups.push(cleanup)
       }
     },
+    /** How many effects the most recent render declared. */
+    pendingEffects: () => frame.effects.length,
     /** Tear down every effect cleanup collected so far. */
     disposeEffects: () => {
       for (const cleanup of effectCleanups.splice(0)) cleanup()
@@ -148,6 +150,14 @@ const EFFORTS = [
 ]
 
 // ── load the bundle ────────────────────────────────────────────────────────
+// The seat schedules its catalog retries through setTimeout. Running timers
+// synchronously keeps every retry assertion observable without making the suite
+// wait real milliseconds.
+const realSetTimeout = globalThis.setTimeout
+const realClearTimeout = globalThis.clearTimeout
+globalThis.setTimeout = (fn) => { fn(); return 0 }
+globalThis.clearTimeout = () => {}
+
 let registration = null
 let react = createReact()
 const window = { __ModuleLoader__: { load: (spec) => { registration = spec } } }
@@ -222,13 +232,23 @@ const render = () => {
  * directory to load, installing the store subscription) must use this rather
  * than calling the component directly.
  *
+ * Re-renders while a render declares fresh effects, because an effect that
+ * schedules follow-up work (the catalog retry) only becomes observable when the
+ * render it triggers runs again. Bounded so a runaway loop fails the suite
+ * instead of hanging it.
+ *
  * @param overrides - props merged over the seat's injected props.
  * @returns the rendered element tree.
  */
 const renderCommitted = (overrides = {}) => {
-  react.keepState()
-  const tree = seatRegistration.component({ ...props, ...overrides })
-  react.runEffects()
+  let tree = null
+  for (let pass = 0; pass < 12; pass += 1) {
+    react.keepState()
+    tree = seatRegistration.component({ ...props, ...overrides })
+    const pending = react.pendingEffects()
+    if (pending === 0) break
+    react.runEffects()
+  }
   return tree
 }
 render()
@@ -348,12 +368,20 @@ check('an unloaded directory still renders the chevron',
   findByClass(treeCold, 'deu-chevron').length === 1)
 check('mounting the seat asks the directory to load',
   cold.calls.load >= 1, `load calls: ${cold.calls.load}`)
+// The catalog loader runs once in a constructor and swallows its failure, so a
+// transient startup failure would otherwise pin the seat on "loading" forever.
+check('a directory stuck in loading is retried, not abandoned',
+  cold.calls.load > 1 && cold.calls.load <= 6, `load calls: ${cold.calls.load}`)
 
 // ── teardown leaves nothing behind ─────────────────────────────────────────
 for (const d of disposers) if (typeof d === 'function') d()
 check('unmount removes the stylesheet', !head.children.some((n) => n.id === 'dsh-effort-ultra-css'))
 
 const failed = results.filter((r) => !r.pass)
+// Restore the real timers before reporting: leaving them synchronous would
+// affect anything Node does afterwards.
+globalThis.setTimeout = realSetTimeout
+globalThis.clearTimeout = realClearTimeout
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`)
 if (failed.length > 0) {
   console.error(`\nFAILED:\n${failed.map((f) => `  - ${f.label}${f.detail === undefined ? '' : ` (${f.detail})`}`).join('\n')}`)
