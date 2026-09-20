@@ -181,8 +181,14 @@ const plugin = registration.factory((name) => {
   throw new Error(`unexpected require(${JSON.stringify(name)})`)
 })
 
-check('plugin injects only services present at boot',
-  Array.isArray(plugin.inject) && plugin.inject.includes('slots') && !plugin.inject.includes('remote.session'),
+// `remote.session` MUST be declared. Cordis delivers `internal/service` only to
+// fibers that declare the service (see ReflectService.notify:
+// `if (!(name in fiber.inject)) continue`). Declaring only `slots` and waiting on
+// that event meant we never heard the service arrive, so registration happened
+// only when the service was already present at apply time — which made the plugin
+// work on some boots and silently do nothing on others.
+check('plugin declares remote.session so apply runs when it is ready',
+  Array.isArray(plugin.inject) && plugin.inject.includes('slots') && plugin.inject.includes('remote.session'),
   JSON.stringify(plugin.inject))
 
 // ── drive apply() ──────────────────────────────────────────────────────────
@@ -197,6 +203,9 @@ const slotsStub = {
   register: (options, component) => { seatRegistration = { options, component }; return () => {} },
 }
 const ctx = {
+  // The plugin reads `ctx.remote.session` directly, because it declares the
+  // dependency and Cordis guarantees it is present before apply runs.
+  remote: { session: remoteSessionStub },
   get: (name) => {
     if (name === 'remote.session') return remoteSessionStub
     if (name === 'sessions') return sessionsStub
@@ -225,12 +234,10 @@ const css = head.children.find((n) => n.id === 'dsh-effort-ultra-css')?.textCont
 check('css is balanced', (css.match(/\{/g) || []).length === (css.match(/\}/g) || []).length, `${css.length} chars`)
 check('css avoids foreign class names', !/_3_LLuW_|_7KE1Ra_/.test(css))
 check('locale dictionaries registered', localeDicts.length === 1 && localeDicts[0].ns === 'effort-ultra')
-// The plugin must NEVER defer its apply behind a dependency gate. Declaring
-// `remote`/`remote.session` in `inject`, or waiting on them with `ctx.inject`,
-// parks the whole plugin when they are not registered yet — and a parked plugin
-// never runs apply(), with no error to point at. It reads them with `ctx.get`
-// instead, which takes no inject, and retries on the service announcement.
-check('plugin never defers apply behind a dependency gate', injectCalls.length === 0, JSON.stringify(injectCalls))
+// The plugin must not ALSO wait on a second gate. `ctx.inject` defers its
+// callback until the declared services exist, so wrapping registration in one
+// silently parked the plugin a second time — the same failure, moved.
+check('plugin never defers apply behind a second dependency gate', injectCalls.length === 0, JSON.stringify(injectCalls))
 check('seat registered on conversation.input.model',
   seatRegistration?.options?.name === 'conversation.input.model', seatRegistration?.options?.name)
 // The seat must WIN the slot: its catalog retries live inside the component, so
