@@ -24,8 +24,9 @@ const check = (label, pass, detail) => {
 // ── stub React ─────────────────────────────────────────────────────────────
 // Hook state lives in a swappable frame so a handler can trigger a re-render.
 const createReact = () => {
-  let frame = { slots: [], index: 0 }
+  let frame = { slots: [], index: 0, effects: [] }
   let onRerender = null
+  const effectCleanups = []
   const React = {
     createElement: (type, props, ...children) => ({
       type,
@@ -48,19 +49,36 @@ const createReact = () => {
     },
     useMemo: (fn) => fn(),
     useCallback: (fn) => fn,
-    useEffect: () => {},
+    // Effects are recorded and flushed by runEffects() after the render that
+    // declared them. A no-op here would silently hide "do X on mount" behaviour.
+    useEffect: (fn, deps) => {
+      frame.effects.push({ fn, deps })
+    },
     useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
   }
   return {
     React,
-    beginRender: (rerender) => { onRerender = rerender; frame = { slots: frame.slots, index: 0 } },
-    keepState: () => { const s = frame.slots; frame = { slots: s, index: 0 } },
+    beginRender: (rerender) => { onRerender = rerender; frame = { slots: frame.slots, index: 0, effects: [] } },
+    keepState: () => { const s = frame.slots; frame = { slots: s, index: 0, effects: [] } },
     /**
      * Drop all hook state and reset the call cursor — what actually happens when
      * a seat unmounts and a new one mounts. Resetting the slot array without the
      * cursor would make the next render read hook state at the wrong positions.
      */
-    freshMount: () => { frame = { slots: [], index: 0 } },
+    freshMount: () => { frame = { slots: [], index: 0, effects: [] } },
+    /** Run the effects declared by the most recent render. */
+    runEffects: () => {
+      const pending = frame.effects
+      frame.effects = []
+      for (const { fn } of pending) {
+        const cleanup = fn()
+        if (typeof cleanup === 'function') effectCleanups.push(cleanup)
+      }
+    },
+    /** Tear down every effect cleanup collected so far. */
+    disposeEffects: () => {
+      for (const cleanup of effectCleanups.splice(0)) cleanup()
+    },
   }
 }
 
@@ -79,18 +97,24 @@ const document = {
 
 // ── the fake official directory ────────────────────────────────────────────
 const makeDirectory = (efforts, options = {}) => {
-  const snapshot = {
-    status: 'ready',
-    current: options.current ?? { provider: 'relay', model: 'gpt-6-astra', reasoningEffort: 'ultra' },
-    groups: options.groups ?? [{
-      id: 'relay',
-      name: 'Relay',
-      models: [{
-        id: 'gpt-6-astra',
-        name: 'GPT-6 Astra',
-        reasoning: { defaultEffort: 'high', efforts },
-      }],
+  // `in` rather than `??` for groups: an intentionally empty group list is
+  // falsy-ish in spirit but must not silently fall back to the default fixture,
+  // or a test that thinks it is exercising "no models" is really testing the
+  // happy path (this exact mistake made an earlier assertion pass for the wrong
+  // reason).
+  const groups = 'groups' in options ? options.groups : [{
+    id: 'relay',
+    name: 'Relay',
+    models: [{
+      id: 'gpt-6-astra',
+      name: 'GPT-6 Astra',
+      reasoning: { defaultEffort: 'high', efforts },
     }],
+  }]
+  const snapshot = {
+    status: options.status ?? 'ready',
+    current: 'current' in options ? options.current : { provider: 'relay', model: 'gpt-6-astra', reasoningEffort: 'ultra' },
+    groups,
     routable: true,
   }
   const calls = { load: 0, select: [], subscribe: 0, snapshot: 0 }
@@ -191,6 +215,22 @@ const render = () => {
   react.keepState()
   tree = seatRegistration.component(props)
 }
+
+/**
+ * Render the seat and flush the effects that render declared, the way React
+ * does after a commit. Tests that care about mount-time behaviour (asking the
+ * directory to load, installing the store subscription) must use this rather
+ * than calling the component directly.
+ *
+ * @param overrides - props merged over the seat's injected props.
+ * @returns the rendered element tree.
+ */
+const renderCommitted = (overrides = {}) => {
+  react.keepState()
+  const tree = seatRegistration.component({ ...props, ...overrides })
+  react.runEffects()
+  return tree
+}
 render()
 
 const findByClass = (node, cls, out = []) => {
@@ -287,6 +327,27 @@ const treeH = seatRegistration.component(withHook)
 check('the renderer-injected hook is used when present', hookCalls === 1, `hook calls: ${hookCalls}`)
 check('the injected hook path renders the ladder',
   findByClass(treeH, 'deu-chipTier').length + findByClass(treeH, 'deu-headValue').length > 0)
+
+// ── the empty-directory window ─────────────────────────────────────────────
+// A directory starts at `{ current: null, groups: [], status: 'loading' }`, so
+// the first render has nothing to label the chip with. v0.1.0 shipped a bare
+// chevron in that window, which reads as a broken control.
+const cold = makeDirectory(EFFORTS, { groups: [], current: null, status: 'loading' })
+react.freshMount()
+// `load` is a closure over one directory, so a test that swaps the store must
+// swap the loader with it — otherwise the counter records the load on the
+// original directory and the assertion reads a stale zero.
+const treeCold = renderCommitted({
+  directory: cold.store,
+  load: () => { cold.calls.load += 1 },
+})
+const coldLabel = findByClass(treeCold, 'deu-chipModel')[0]?.props?.children
+check('an unloaded directory shows placeholder copy, not an empty chip',
+  typeof coldLabel === 'string' && coldLabel.length > 0, JSON.stringify(coldLabel))
+check('an unloaded directory still renders the chevron',
+  findByClass(treeCold, 'deu-chevron').length === 1)
+check('mounting the seat asks the directory to load',
+  cold.calls.load >= 1, `load calls: ${cold.calls.load}`)
 
 // ── teardown leaves nothing behind ─────────────────────────────────────────
 for (const d of disposers) if (typeof d === 'function') d()
