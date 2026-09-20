@@ -55,6 +55,12 @@ const createReact = () => {
     React,
     beginRender: (rerender) => { onRerender = rerender; frame = { slots: frame.slots, index: 0 } },
     keepState: () => { const s = frame.slots; frame = { slots: s, index: 0 } },
+    /**
+     * Drop all hook state and reset the call cursor — what actually happens when
+     * a seat unmounts and a new one mounts. Resetting the slot array without the
+     * cursor would make the next render read hook state at the wrong positions.
+     */
+    freshMount: () => { frame = { slots: [], index: 0 } },
   }
 }
 
@@ -87,13 +93,23 @@ const makeDirectory = (efforts, options = {}) => {
     }],
     routable: true,
   }
-  const calls = { load: 0, select: [] }
+  const calls = { load: 0, select: [], subscribe: 0, snapshot: 0 }
   return {
     calls,
+    // exposed so a test can simulate the store changing
+    setCurrent: (current) => { snapshot.current = current },
     snapshot,
     store: {
-      subscribe: () => () => {},
-      getSnapshot: () => snapshot,
+      subscribe: () => { calls.subscribe += 1; return () => {} },
+      getSnapshot: () => {
+        calls.snapshot += 1
+        // `unstable: true` models the shape that shipped in v0.1.0: a fresh
+        // object per call. react-dom compares snapshots by reference, so a
+        // component feeding this straight into useSyncExternalStore loops until
+        // it dies with React error #185. The fake has to reproduce that shape or
+        // it can never catch the bug.
+        return options.unstable === true ? { ...snapshot } : snapshot
+      },
     },
     load: () => { calls.load += 1; return Promise.resolve() },
     select: (selection) => { calls.select.push(selection); return Promise.resolve() },
@@ -217,24 +233,60 @@ check('reset omits reasoningEffort (lets the model default apply)',
   JSON.stringify(directory.calls.select[1]))
 
 // ── Host contract edge cases ───────────────────────────────────────────────
+// Each scenario gets a FRESH mount. The component caches the directory snapshot
+// so store writes cannot tear a render; reusing the instance above would show
+// the previous scenario's cached state instead of the new store.
 const cliff = makeDirectory(EFFORTS)
 cliff.snapshot.current = { provider: 'relay', model: 'gpt-6-astra' }   // no explicit choice
-const props2 = { ...props, directory: cliff.store }
-react.keepState()
-const tree2 = seatRegistration.component(props2)
+react.freshMount()
+const tree2 = seatRegistration.component({ ...props, directory: cliff.store })
 // The panel is still open from the interactions above, and an open panel
 // replaces the chip — so read the tier label from the panel head.
 const head2 = findByClass(tree2, 'deu-headValue')[0]?.props?.children ?? findByClass(tree2, 'deu-chipTier')[0]?.props?.children
 check('no explicit choice shows the model default label', head2 === '跟随模型默认', String(head2))
 check('no explicit choice is not flagged as the top tier', tree2.props['data-top'] === 'false', String(tree2.props['data-top']))
 
-const bare = makeDirectory([])
-bare.snapshot.current = { provider: 'relay', model: 'gpt-6-astra' }
+// A model that EXISTS but declares no reasoning ladder — the real-world case,
+// not "no models at all" (which would leave nothing to render a control for).
+const bare = makeDirectory(EFFORTS)
 bare.snapshot.groups[0].models[0].reasoning = undefined
+react.freshMount()
+react.keepState()   // reset the hook cursor for the fresh mount
+const treeB0 = seatRegistration.component({ ...props, directory: bare.store })
+findByClass(treeB0, 'deu-chip')[0].props.onClick()
 react.keepState()
-findByClass(seatRegistration.component({ ...props, directory: bare.store }), 'deu-note')
+const treeB = seatRegistration.component({ ...props, directory: bare.store })
 check('a model with no ladder renders a note, not a broken bar',
-  findByClass(seatRegistration.component({ ...props, directory: bare.store }), 'deu-barWrap').length === 0)
+  findByClass(treeB, 'deu-note').length === 1 && findByClass(treeB, 'deu-barWrap').length === 0)
+check('a model with no ladder still shows its name on the chip',
+  findByClass(treeB, 'deu-headValue').length === 1)
+
+// ── regression: the v0.1.0 field failure ──────────────────────────────────
+// v0.1.0 fed `useSyncExternalStore(() => store.getSnapshot())` straight to
+// react-dom. When the real store re-creates its snapshot per call, react-dom
+// sees a change on every render and aborts with React error #185 ("Maximum
+// update depth exceeded"), which is what crashed the seat in the field. The
+// old fake always returned one frozen object, so the suite stayed green.
+const unstable = makeDirectory(EFFORTS, { unstable: true })
+react.keepState()
+const treeU = seatRegistration.component({ ...props, directory: unstable.store })
+check('an unstable store still renders a usable ladder',
+  findByClass(treeU, 'deu-chipTier').length + findByClass(treeU, 'deu-headValue').length > 0)
+check('an unstable store does not re-read the snapshot per render',
+  unstable.calls.snapshot <= 2, `getSnapshot calls: ${unstable.calls.snapshot}`)
+
+// the injected hook must be preferred when the renderer supplies one
+let hookCalls = 0
+const withHook = {
+  ...props,
+  directory: unstable.store,
+  useModelDirectory: (selector) => { hookCalls += 1; return selector(unstable.snapshot) },
+}
+react.keepState()
+const treeH = seatRegistration.component(withHook)
+check('the renderer-injected hook is used when present', hookCalls === 1, `hook calls: ${hookCalls}`)
+check('the injected hook path renders the ladder',
+  findByClass(treeH, 'deu-chipTier').length + findByClass(treeH, 'deu-headValue').length > 0)
 
 // ── teardown leaves nothing behind ─────────────────────────────────────────
 for (const d of disposers) if (typeof d === 'function') d()
