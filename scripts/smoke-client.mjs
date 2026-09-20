@@ -179,14 +179,20 @@ check('plugin injects only services that exist at boot',
 // ── drive apply() with a stub ctx ──────────────────────────────────────────
 const disposers = []
 const serviceListeners = []
+const injectCalls = []
 let seatRegistration = null
 const localeDicts = []
 const directory = makeDirectory(EFFORTS)
 
+const slotsStub = {
+  inject: (name, cb) => { cb(); return () => {} },
+  register: (options, component) => { seatRegistration = { options, component }; return () => {} },
+}
 const ctx = {
   get: (name) => {
     if (name === 'modelDirectories') return { directoryFor: () => directory }
     if (name === 'sessions') return { subagentAddress: () => undefined }
+    if (name === 'slots') return slotsStub
     if (name === 'locale') {
       return {
         register: (ns, dicts) => { localeDicts.push({ ns, dicts }); return () => {} },
@@ -198,12 +204,18 @@ const ctx = {
   },
   effect: (fn) => { disposers.push(fn()) },
   on: (name, listener) => { serviceListeners.push({ name, listener }); return () => {} },
-  slots: {
-    inject: (name, cb) => { cb(); return () => {} },
-    register: (options, component) => { seatRegistration = { options, component }; return () => {} },
-  },
+  slots: slotsStub,
 }
+// `ctx.inject(deps, cb)` waits for those services in its own scope without
+// parking this plugin. The stub runs the callback immediately with a scope that
+// answers the same lookups the real one does.
+ctx.inject = (deps, callback) => { injectCalls.push(deps); callback(ctx); return () => {} }
+
 plugin.apply(ctx)
+
+check('seat registration waits for a scope that declares remote',
+  injectCalls.some((deps) => Array.isArray(deps) && deps.includes('remote') && deps.includes('remote.session')),
+  JSON.stringify(injectCalls))
 
 check('stylesheet appended to head', head.children.some((n) => n.id === 'dsh-effort-ultra-css'))
 const css = head.children.find((n) => n.id === 'dsh-effort-ultra-css')?.textContent ?? ''
