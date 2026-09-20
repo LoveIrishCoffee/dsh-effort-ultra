@@ -1,0 +1,56 @@
+﻿name: Publish to npm
+
+# Publishing is tag-driven so a release is an explicit act:
+#   npm version patch && git push --follow-tags
+#
+# Authentication uses npm Trusted Publishing (OIDC) 鈥?no long-lived token is
+# stored in this repository. Configure it once on npmjs.com:
+#   Package 鈫?Settings 鈫?Trusted Publisher 鈫?GitHub Actions
+#     repository: <owner>/dsh-effort-ultra
+#     workflow:   publish.yml
+# Alternatively, replace the OIDC step with NODE_AUTH_TOKEN from an
+# NPM_TOKEN repository secret.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write # required for npm provenance / trusted publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install
+        run: npm install
+
+      - name: Verify (typecheck, smoke test, dist in sync)
+        run: |
+          npm run typecheck
+          npm test
+          npm run check:dist
+
+      - name: Refuse to publish a tag that disagrees with package.json
+        run: |
+          node -e '
+          const tag = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+          const version = require("./package.json").version;
+          if (tag !== version) {
+            console.error(`FAIL: tag v${tag} does not match package.json version ${version}`);
+            process.exit(1);
+          }
+          console.log(`tag v${tag} matches package.json ${version}`);
+          '
+
+      - name: Publish
+        run: npm publish --access public --provenance

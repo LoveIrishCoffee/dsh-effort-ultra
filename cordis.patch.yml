@@ -1,0 +1,18 @@
+# dsh-effort-ultra bundle layer — registers the HOST half into a profile.
+#
+# The host half is intentionally inert (no route, no tool, no service) — it
+# exists only so this package has a row in the composed plugin tree. The whole
+# feature is the browser half.
+#
+# The BROWSER half needs no row here: the module loader auto-discovers the
+# client bundle from package.json `exports["./client"]` + `dsh.client`.
+#
+# PITFALL: `name` is a PACKAGE NAME (resolved via the profile's node_modules),
+# NOT a relative path.
+#
+# This plugin owns the `conversation.input.model` seat at priority -20, which
+# shadows both DSH's built-in model selector (0) and third-party effort controls
+# that register at -10. Uninstalling it restores whichever of those was next.
+- insert:
+    - id: effort-ultra
+      name: dsh-effort-ultra

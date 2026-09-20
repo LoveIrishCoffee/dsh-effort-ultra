@@ -1,0 +1,65 @@
+{
+  "name": "dsh-effort-ultra",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 的原生推理档位控件：composer 里的推理等级档位条，蓝紫渐变 + 星点 + 流光，档位由模型的 reasoning 声明自动决定。 / A native reasoning-effort control for the DSH composer: a blue-to-violet tier bar with a starfield and a sheen sweep, with the ladder taken from each model's own reasoning declaration.",
+  "license": "MIT",
+  "author": "LoveIrishCoffee",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LoveIrishCoffee/dsh-effort-ultra.git"
+  },
+  "homepage": "https://github.com/LoveIrishCoffee/dsh-effort-ultra#readme",
+  "bugs": {
+    "url": "https://github.com/LoveIrishCoffee/dsh-effort-ultra/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "screenshots.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node scripts/smoke-client.mjs && node scripts/check-package-contract.mjs",
+    "check:dist": "npm run build && git diff --exit-code -- dist",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.0"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "reasoning-effort",
+    "thinking-effort",
+    "composer",
+    "web-ui"
+  ]
+}

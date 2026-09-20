@@ -1,0 +1,41 @@
+﻿name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The DSH plugin ecosystem installs with pnpm, so the lockfile of record
+      # is pnpm-lock.yaml.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Browser-half smoke test
+        run: pnpm test
+
+      - name: Committed dist/ matches src/
+        # `dist/` is committed so `dsh plugin add github:...` works without a
+        # build step. This fails the build if someone edits src/ and forgets to
+        # re-run the build, instead of letting the published output drift.
+        run: pnpm run check:dist
+
+      - name: Package contract (dsh fields)
+        run: node scripts/check-package-contract.mjs
