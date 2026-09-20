@@ -217,11 +217,11 @@ check('plugin watches internal/service so a late directory still registers',
 
 check('seat registered on conversation.input.model',
   seatRegistration?.options?.name === 'conversation.input.model', seatRegistration?.options?.name)
-// The seat registers BEHIND the shipped entry (priority 0) on purpose: taking
-// it outright shadows the component whose mount drives the catalog load, which
-// left the directory stuck on "loading". Pinned here so it cannot regress.
-check('seat priority defers to the shipped entry',
-  seatRegistration?.options?.priority === 1, String(seatRegistration?.options?.priority))
+// The seat must WIN the slot. Registering behind the shipped entry (1) deadlocked:
+// the catalog retries live inside this component, so an entry that never renders
+// can never load anything. Pinned here so the deadlock cannot come back.
+check('seat priority takes the slot so the retry can run',
+  seatRegistration?.options?.priority === -20, String(seatRegistration?.options?.priority))
 
 // ── render ─────────────────────────────────────────────────────────────────
 const props = seatRegistration.options.inject('session-1')
