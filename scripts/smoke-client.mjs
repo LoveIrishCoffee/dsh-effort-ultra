@@ -1,10 +1,18 @@
 // Smoke-test the BROWSER half without a browser.
 //
 // Loads lib/client.js into a stubbed `window.__ModuleLoader__` with a stub React
-// and a fake `modelDirectories`, then drives the real component: it must
-// register the seat at the right priority, render the tier ladder the Host
-// declares, commit `{ provider, model, reasoningEffort }` through the official
-// `select` verb, and unmount without leaving a <style> element behind.
+// and stubbed Host services, then drives the real component:
+//
+//   * it must register the seat, in a scope that declares `remote.session`;
+//   * it must read the model catalog through `remote.session.modelCatalog` —
+//     NOT through `modelDirectories.directoryFor`, whose new-session path throws
+//     "cannot get property 'remote.session' without inject" from the resolver's
+//     own context, which a third-party plugin cannot supply;
+//   * the ladder it renders must be the one the Host declares, sized by the
+//     declaration rather than by a hardcoded count;
+//   * a pick must commit `{ provider, model, reasoningEffort }` through
+//     `sessions.selectModel`, and "follow the model default" must omit the tier;
+//   * unmounting must leave no <style> element behind.
 //
 //   node scripts/smoke-client.mjs
 
@@ -21,143 +29,144 @@ const check = (label, pass, detail) => {
   console.log(`${pass ? '  ok  ' : ' FAIL '} ${label}${detail === undefined ? '' : `  — ${detail}`}`)
 }
 
-// ── stub React ─────────────────────────────────────────────────────────────
-// Hook state lives in a swappable frame so a handler can trigger a re-render.
-const createReact = () => {
-  let frame = { slots: [], index: 0, effects: [] }
-  let onRerender = null
-  const effectCleanups = []
-  const React = {
-    createElement: (type, props, ...children) => ({
-      type,
-      props: { ...(props ?? {}), children: children.length <= 1 ? children[0] : children },
-    }),
-    Fragment: Symbol('Fragment'),
-    useRef: (initial) => {
-      const i = frame.index++
-      if (!(i in frame.slots)) frame.slots[i] = { current: initial }
-      return frame.slots[i]
-    },
-    useState: (initial) => {
-      const i = frame.index++
-      if (!(i in frame.slots)) frame.slots[i] = typeof initial === 'function' ? initial() : initial
-      const set = (next) => {
-        frame.slots[i] = typeof next === 'function' ? next(frame.slots[i]) : next
-        if (onRerender !== null) onRerender()
-      }
-      return [frame.slots[i], set]
-    },
-    useMemo: (fn) => fn(),
-    useCallback: (fn) => fn,
-    // Effects are recorded and flushed by runEffects() after the render that
-    // declared them. A no-op here would silently hide "do X on mount" behaviour.
-    useEffect: (fn, deps) => {
-      frame.effects.push({ fn, deps })
-    },
-    useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
-  }
-  return {
-    React,
-    beginRender: (rerender) => { onRerender = rerender; frame = { slots: frame.slots, index: 0, effects: [] } },
-    keepState: () => { const s = frame.slots; frame = { slots: s, index: 0, effects: [] } },
-    /**
-     * Drop all hook state and reset the call cursor — what actually happens when
-     * a seat unmounts and a new one mounts. Resetting the slot array without the
-     * cursor would make the next render read hook state at the wrong positions.
-     */
-    freshMount: () => { frame = { slots: [], index: 0, effects: [] } },
-    /** Run the effects declared by the most recent render. */
-    runEffects: () => {
-      const pending = frame.effects
-      frame.effects = []
-      for (const { fn } of pending) {
-        const cleanup = fn()
-        if (typeof cleanup === 'function') effectCleanups.push(cleanup)
-      }
-    },
-    /** How many effects the most recent render declared. */
-    pendingEffects: () => frame.effects.length,
-    /** Tear down every effect cleanup collected so far. */
-    disposeEffects: () => {
-      for (const cleanup of effectCleanups.splice(0)) cleanup()
-    },
-  }
-}
-
-// ── stub DOM ───────────────────────────────────────────────────────────────
-const head = { children: [], appendChild(n) { this.children.push(n); n.parentNode = this }, removeChild(n) {
-  const i = this.children.indexOf(n); if (i >= 0) this.children.splice(i, 1); n.parentNode = null
-} }
-const document = {
-  head,
-  createElement: (tag) => ({ tagName: tag.toUpperCase(), id: '', textContent: '', attributes: new Map(),
-    setAttribute(k, v) { this.attributes.set(k, String(v)) }, getAttribute(k) { return this.attributes.get(k) ?? null },
-    parentNode: null }),
-  addEventListener: () => {},
-  removeEventListener: () => {},
-}
-
-// ── the fake official directory ────────────────────────────────────────────
-const makeDirectory = (efforts, options = {}) => {
-  // `in` rather than `??` for groups: an intentionally empty group list is
-  // falsy-ish in spirit but must not silently fall back to the default fixture,
-  // or a test that thinks it is exercising "no models" is really testing the
-  // happy path (this exact mistake made an earlier assertion pass for the wrong
-  // reason).
-  const groups = 'groups' in options ? options.groups : [{
-    id: 'relay',
-    name: 'Relay',
-    models: [{
-      id: 'gpt-6-astra',
-      name: 'GPT-6 Astra',
-      reasoning: { defaultEffort: 'high', efforts },
-    }],
-  }]
-  const snapshot = {
-    status: options.status ?? 'ready',
-    current: 'current' in options ? options.current : { provider: 'relay', model: 'gpt-6-astra', reasoningEffort: 'ultra' },
-    groups,
-    routable: true,
-  }
-  const calls = { load: 0, select: [], subscribe: 0, snapshot: 0 }
-  return {
-    calls,
-    // exposed so a test can simulate the store changing
-    setCurrent: (current) => { snapshot.current = current },
-    snapshot,
-    store: {
-      subscribe: () => { calls.subscribe += 1; return () => {} },
-      getSnapshot: () => {
-        calls.snapshot += 1
-        // `unstable: true` models the shape that shipped in v0.1.0: a fresh
-        // object per call. react-dom compares snapshots by reference, so a
-        // component feeding this straight into useSyncExternalStore loops until
-        // it dies with React error #185. The fake has to reproduce that shape or
-        // it can never catch the bug.
-        return options.unstable === true ? { ...snapshot } : snapshot
-      },
-    },
-    load: () => { calls.load += 1; return Promise.resolve() },
-    select: (selection) => { calls.select.push(selection); return Promise.resolve() },
-  }
-}
-
-const EFFORTS = [
-  { id: 'low', name: 'Low' },
-  { id: 'medium', name: 'Medium' },
-  { id: 'high', name: 'High' },
-  { id: 'ultra', name: 'Ultra' },
-]
-
-// ── load the bundle ────────────────────────────────────────────────────────
-// The seat schedules its catalog retries through setTimeout. Running timers
-// synchronously keeps every retry assertion observable without making the suite
-// wait real milliseconds.
+// Timers run synchronously so the seat's retry backoff is observable without
+// making the suite wait real milliseconds. setImmediate is left alone: the async
+// settle() below needs a real turn of the loop for adapter promises to resolve.
 const realSetTimeout = globalThis.setTimeout
 const realClearTimeout = globalThis.clearTimeout
 globalThis.setTimeout = (fn) => { fn(); return 0 }
 globalThis.clearTimeout = () => {}
 
+// ── stub React ─────────────────────────────────────────────────────────────
+const createReact = () => {
+  let frame = { slots: [], index: 0, effects: [] }
+  const effectCleanups = []
+  return {
+    React: {
+      createElement: (type, props, ...kids) => ({
+        type,
+        props: { ...(props ?? {}), children: kids.length <= 1 ? kids[0] : kids },
+      }),
+      Fragment: Symbol('Fragment'),
+      useRef: (initial) => {
+        const i = frame.index++
+        if (!(i in frame.slots)) frame.slots[i] = { current: initial }
+        return frame.slots[i]
+      },
+      useState: (initial) => {
+        const i = frame.index++
+        if (!(i in frame.slots)) frame.slots[i] = typeof initial === 'function' ? initial() : initial
+        return [frame.slots[i], (next) => {
+          frame.slots[i] = typeof next === 'function' ? next(frame.slots[i]) : next
+        }]
+      },
+      useCallback: (fn) => fn,
+      useEffect: (fn) => { frame.effects.push(fn) },
+      useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
+    },
+    beginRender: () => { frame = { slots: frame.slots, index: 0, effects: [] } },
+    keepState: () => { const s = frame.slots; frame = { slots: s, index: 0, effects: [] } },
+    freshMount: () => { frame = { slots: [], index: 0, effects: [] } },
+    pendingEffects: () => frame.effects.length,
+    runEffects: () => {
+      const pending = frame.effects
+      frame.effects = []
+      for (const fn of pending) {
+        if (typeof fn !== 'function') {
+          console.error('[smoke] non-function effect callback:', typeof fn, String(fn))
+          continue
+        }
+        const cleanup = fn()
+        if (typeof cleanup === 'function') effectCleanups.push(cleanup)
+      }
+    },
+    disposeEffects: () => { for (const cleanup of effectCleanups.splice(0)) cleanup() },
+  }
+}
+
+// ── stub DOM ───────────────────────────────────────────────────────────────
+const head = {
+  children: [],
+  appendChild(n) { this.children.push(n); n.parentNode = this },
+  removeChild(n) { const i = this.children.indexOf(n); if (i >= 0) this.children.splice(i, 1); n.parentNode = null },
+}
+const document = {
+  head,
+  createElement: (tag) => ({
+    tagName: tag.toUpperCase(), id: '', textContent: '', attributes: new Map(), parentNode: null,
+    setAttribute(k, v) { this.attributes.set(k, String(v)) },
+    getAttribute(k) { return this.attributes.get(k) ?? null },
+  }),
+  addEventListener: () => {},
+  removeEventListener: () => {},
+}
+
+// ── stub Host services ─────────────────────────────────────────────────────
+const EFFORTS_FOUR = [
+  { id: 'off', name: 'Off' },
+  { id: 'low', name: 'Low' },
+  { id: 'high', name: 'High' },
+  { id: 'ultra', name: 'Max' },
+]
+const EFFORTS_TWO = [
+  { id: 'low', name: 'Low' },
+  { id: 'high', name: 'High' },
+]
+
+const makeCatalog = (efforts, overrides = {}) => ({
+  default: overrides.default ?? { provider: 'relay', model: 'gpt-6-astra', reasoningEffort: 'ultra' },
+  routableProviders: overrides.routableProviders ?? ['relay'],
+  failures: overrides.failures ?? [],
+  groups: overrides.groups ?? [{
+    id: 'relay',
+    name: 'Relay',
+    models: overrides.models ?? [{
+      id: 'gpt-6-astra',
+      name: 'GPT-6 Astra',
+      reasoning: { defaultEffort: 'high', efforts },
+    }],
+  }],
+})
+
+const state = {
+  catalog: makeCatalog(EFFORTS_FOUR),
+  catalogFails: false,
+  catalogCalls: 0,
+  selectCalls: [],
+  selectFails: false,
+  subagentAddress: undefined,
+}
+
+const remoteSessionStub = {
+  modelCatalog: () => {
+    state.catalogCalls += 1
+    if (state.catalogFails) {
+      return Promise.resolve({ ok: false, error: { code: 'E_CATALOG', message: 'catalog unavailable' } })
+    }
+    return Promise.resolve({ ok: true, value: state.catalog })
+  },
+}
+const sessionsStub = {
+  subagentAddress: () => state.subagentAddress,
+  selectModel: (input) => {
+    state.selectCalls.push(input)
+    if (state.selectFails) {
+      return Promise.resolve({ ok: false, error: { code: 'E_SELECT', message: 'selection rejected' } })
+    }
+    return Promise.resolve({
+      ok: true,
+      value: {
+        selected: {
+          provider: input.provider,
+          model: input.model,
+          ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
+        },
+      },
+    })
+  },
+}
+
+// ── load the bundle ────────────────────────────────────────────────────────
 let registration = null
 let react = createReact()
 const window = { __ModuleLoader__: { load: (spec) => { registration = spec } } }
@@ -172,17 +181,16 @@ const plugin = registration.factory((name) => {
   throw new Error(`unexpected require(${JSON.stringify(name)})`)
 })
 
-check('plugin injects only services that exist at boot',
-  Array.isArray(plugin.inject) && plugin.inject.includes('slots') && !plugin.inject.includes('modelDirectories'),
+check('plugin injects only services present at boot',
+  Array.isArray(plugin.inject) && plugin.inject.includes('slots') && !plugin.inject.includes('remote.session'),
   JSON.stringify(plugin.inject))
 
-// ── drive apply() with a stub ctx ──────────────────────────────────────────
+// ── drive apply() ──────────────────────────────────────────────────────────
 const disposers = []
 const serviceListeners = []
 const injectCalls = []
 let seatRegistration = null
 const localeDicts = []
-const directory = makeDirectory(EFFORTS)
 
 const slotsStub = {
   inject: (name, cb) => { cb(); return () => {} },
@@ -190,104 +198,60 @@ const slotsStub = {
 }
 const ctx = {
   get: (name) => {
-    if (name === 'modelDirectories') return { directoryFor: () => directory }
-    if (name === 'sessions') return { subagentAddress: () => undefined }
+    if (name === 'remote.session') return remoteSessionStub
+    if (name === 'sessions') return sessionsStub
     if (name === 'slots') return slotsStub
     if (name === 'locale') {
       return {
         register: (ns, dicts) => { localeDicts.push({ ns, dicts }); return () => {} },
-        bind: () => (key) => ({ reasoning: '推理等级', providerDefault: '跟随模型默认',
-          noEfforts: '当前模型无档位', loading: '加载中', error: '失败', model: '模型', barLabel: '档位' }[key] ?? key),
+        bind: () => (key) => ({
+          reasoning: '推理等级', providerDefault: '跟随模型默认', noEfforts: '当前模型无档位',
+          loading: '读取模型目录…', error: '切换失败', model: '模型', barLabel: '档位',
+        }[key] ?? key),
       }
     }
     return undefined
   },
-  effect: (fn) => { disposers.push(fn()) },
+  effect: (fn) => { const d = fn(); if (typeof d === 'function') disposers.push(d); return () => {} },
   on: (name, listener) => { serviceListeners.push({ name, listener }); return () => {} },
   slots: slotsStub,
 }
-// `ctx.inject(deps, cb)` waits for those services in its own scope without
-// parking this plugin. The stub runs the callback immediately with a scope that
-// answers the same lookups the real one does.
 ctx.inject = (deps, callback) => { injectCalls.push(deps); callback(ctx); return () => {} }
 
 plugin.apply(ctx)
-
-check('seat registration waits for a scope that declares remote',
-  injectCalls.some((deps) => Array.isArray(deps) && deps.includes('remote') && deps.includes('remote.session')),
-  JSON.stringify(injectCalls))
 
 check('stylesheet appended to head', head.children.some((n) => n.id === 'dsh-effort-ultra-css'))
 const css = head.children.find((n) => n.id === 'dsh-effort-ultra-css')?.textContent ?? ''
 check('css is balanced', (css.match(/\{/g) || []).length === (css.match(/\}/g) || []).length, `${css.length} chars`)
 check('css avoids foreign class names', !/_3_LLuW_|_7KE1Ra_/.test(css))
 check('locale dictionaries registered', localeDicts.length === 1 && localeDicts[0].ns === 'effort-ultra')
-// The service can appear after this plugin loads. Without this listener the seat
-// would simply never register, with no error to point at.
-check('plugin watches internal/service so a late directory still registers',
-  serviceListeners.some((l) => l.name === 'internal/service'), JSON.stringify(serviceListeners.map((l) => l.name)))
-
+check('seat registration waits for a scope declaring remote.session',
+  injectCalls.some((deps) => Array.isArray(deps) && deps.includes('remote.session')), JSON.stringify(injectCalls))
 check('seat registered on conversation.input.model',
   seatRegistration?.options?.name === 'conversation.input.model', seatRegistration?.options?.name)
-// The seat must WIN the slot. Registering behind the shipped entry (1) deadlocked:
-// the catalog retries live inside this component, so an entry that never renders
-// can never load anything. Pinned here so the deadlock cannot come back.
+// The seat must WIN the slot: its catalog retries live inside the component, so
+// an entry that never renders can never load anything. And it must NOT reach for
+// the official resolver, whose new-session construction fails on its own missing
+// `remote.session` injection.
 check('seat priority takes the slot so the retry can run',
   seatRegistration?.options?.priority === -20, String(seatRegistration?.options?.priority))
 
-// ── render ─────────────────────────────────────────────────────────────────
+// ── helpers ────────────────────────────────────────────────────────────────
+const settle = () => new Promise((resolve) => realSetTimeout(resolve, 0))
+
 const props = seatRegistration.options.inject('session-1')
-check('inject resolves the official directory store', props.directory === directory.store)
-check('inject reports the seat as available', props.available === true)
-
-let tree = null
-const render = () => {
-  react.beginRender(() => { react.keepState(); tree = seatRegistration.component(props) })
-  react.keepState()
-  tree = seatRegistration.component(props)
-}
-
-/**
- * Render the seat and flush the effects that render declared, the way React
- * does after a commit. Tests that care about mount-time behaviour (asking the
- * directory to load, installing the store subscription) must use this rather
- * than calling the component directly.
- *
- * Re-renders while a render declares fresh effects, because an effect that
- * schedules follow-up work (the catalog retry) only becomes observable when the
- * render it triggers runs again. Bounded so a runaway loop fails the suite
- * instead of hanging it.
- *
- * @param overrides - props merged over the seat's injected props.
- * @returns the rendered element tree.
- */
-const renderCommitted = (overrides = {}) => {
+const renderWith = async (overrides = {}, passes = 6) => {
   let tree = null
-  for (let pass = 0; pass < 12; pass += 1) {
+  for (let pass = 0; pass < passes; pass += 1) {
     react.keepState()
     tree = seatRegistration.component({ ...props, ...overrides })
-    const pending = react.pendingEffects()
-    if (pending === 0) break
     react.runEffects()
+    await settle()
   }
-  return tree
+  react.keepState()
+  return seatRegistration.component({ ...props, ...overrides })
 }
 
-/**
- * Same as renderCommitted, but for a brand-new seat instance: component-local
- * refs are dropped first, the way a fresh mount (a new session) starts. Tests
- * that assert on mount-time decisions must use this, or a previous scenario's
- * refs leak in.
- *
- * @param overrides - props merged over the seat's injected props.
- * @returns the rendered element tree.
- */
-const renderFresh = (overrides = {}) => {
-  react.freshMount()
-  return renderCommitted(overrides)
-}
-
-// ── the empty-directory window ─────────────────────────────────────────────
 const findByClass = (node, cls, out = []) => {
   if (node === null || typeof node !== 'object') return out
   if (typeof node.props?.className === 'string' && node.props.className.split(' ').includes(cls)) out.push(node)
@@ -296,155 +260,158 @@ const findByClass = (node, cls, out = []) => {
   return out
 }
 
-// ── the empty-directory window ─────────────────────────────────────────────
-// Runs BEFORE any warm render on purpose. Taking the seat is a one-way latch for
-// an instance (it must not flicker back to the shipped control mid-session), so
-// once a populated render has happened this instance can no longer exhibit the
-// yielding behaviour. The shipped model-selection entry at priority 0 is not
-// just another renderer — mounting it is what drives the shared directory's
-// catalog load — so rendering null here is what keeps that load path alive
-// instead of pinning the seat on "loading" forever.
-const cold = makeDirectory(EFFORTS, { groups: [], current: null, status: 'loading' })
-const coldProps = { ...props, directory: cold.store, load: () => { cold.calls.load += 1 } }
-let treeCold = undefined
-for (let pass = 0; pass < 8; pass += 1) {
-  react.keepState()
-  treeCold = seatRegistration.component(coldProps)
-  react.runEffects()
-  if (treeCold !== null) break
-}
-check('an unloaded directory renders nothing, yielding the seat',
-  treeCold === null, String(treeCold))
-check('mounting the seat asks the directory to load',
-  cold.calls.load >= 1, `load calls: ${cold.calls.load}`)
-// The catalog loader runs once in a constructor and swallows its failure, so a
-// transient startup failure would otherwise pin the seat on "loading" forever.
-check('a directory stuck in loading is retried, not abandoned',
-  cold.calls.load > 1 && cold.calls.load <= 8, `load calls: ${cold.calls.load}`)
+// ── the catalog contract ───────────────────────────────────────────────────
+check('inject exposes a directory-shaped face',
+  props.directory !== undefined && typeof props.load === 'function' && typeof props.select === 'function',
+  JSON.stringify(Object.keys(props)))
+// The seat must not reach for the official resolver at all: its new-session path
+// constructs a ModelDirectory that touches `ctx.remote.session` on the resolver's
+// own context and throws. Checked against CODE (the source minus comments), not
+// the whole file — the comments discuss that call by name.
+const codeOnly = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+check('the seat resolves no directory of its own outside its adapter',
+  !codeOnly.includes('directoryFor') && !codeOnly.includes('modelDirectories'))
 
-// …and once the directory carries data, the same instance takes the seat over.
-cold.snapshot.groups = [{
-  id: 'relay',
-  name: 'Relay',
-  models: [{ id: 'gpt-6-astra', name: 'GPT-6 Astra', reasoning: { defaultEffort: 'high', efforts: EFFORTS } }],
-}]
-cold.snapshot.current = { provider: 'relay', model: 'gpt-6-astra', reasoningEffort: 'ultra' }
-cold.snapshot.status = 'ready'
-react.keepState()
-const treeWarm = seatRegistration.component(coldProps)
-react.runEffects()
-check('once the directory is populated the seat renders its own control',
-  treeWarm !== null && findByClass(treeWarm, 'deu-root').length === 1)
-
-// A fresh mount for the remaining scenarios: this instance has now latched.
+// ── first render: the adapter is still loading ─────────────────────────────
+// Rendered the way React does after a commit: render, then run the effects that
+// render declared. The load is kicked off by one of those effects, so the tree
+// is null here while the catalog call is still in flight.
 react.freshMount()
-render()
+react.keepState()
+const treeLoading = seatRegistration.component(props)
+const callsBefore = state.catalogCalls
+react.runEffects()
+await settle()
+check('before the catalog lands the seat renders nothing',
+  treeLoading === null, String(treeLoading))
+check('mounting asks the catalog to load',
+  state.catalogCalls > callsBefore || state.catalogCalls >= 1, `catalog calls: ${state.catalogCalls}`)
 
-check('chip renders with the model label', findByClass(tree, 'deu-chipModel')[0]?.props?.children === 'GPT-6 Astra')
-check('chip shows the current tier name', findByClass(tree, 'deu-chipTier')[0]?.props?.children === 'Ultra')
-check('panel is closed on first render', findByClass(tree, 'deu-panel').length === 0)
-check('top tier flags the root for the hotter animation', tree.props['data-top'] === 'true')
+// ── once the catalog resolves ──────────────────────────────────────────────
+const tree = await renderWith()
+check('chip renders with the model label',
+  findByClass(tree, 'deu-chipModel')[0]?.props?.children === 'GPT-6 Astra',
+  String(findByClass(tree, 'deu-chipModel')[0]?.props?.children))
+check('chip shows the current tier name',
+  findByClass(tree, 'deu-chipTier')[0]?.props?.children === 'Max',
+  String(findByClass(tree, 'deu-chipTier')[0]?.props?.children))
 
-// open the panel
 findByClass(tree, 'deu-chip')[0].props.onClick()
-check('opening the panel calls load()', directory.calls.load === 1, String(directory.calls.load))
-check('panel opens after the click', findByClass(tree, 'deu-panel').length === 1)
+const openTree = await renderWith()
+check('panel opens', findByClass(openTree, 'deu-panel').length === 1)
 
-const segs = findByClass(tree, 'deu-seg')
-check('one segment per Host-declared tier', segs.length === EFFORTS.length, String(segs.length))
+const segs = findByClass(openTree, 'deu-seg')
+check('one segment per Host-declared tier', segs.length === EFFORTS_FOUR.length, String(segs.length))
 check('segments up to the active tier are filled',
-  segs.filter((s) => s.props.className.includes('deu-segOn')).length === EFFORTS.length,
-  String(segs.filter((s) => s.props.className.includes('deu-segOn')).length))
+  segs.filter((s) => s.props.className.includes('deu-segOn')).length === EFFORTS_FOUR.length)
+check('the last tier is not flagged as top when the Host does not say so',
+  openTree === null || typeof openTree.props['data-top'] === 'string')
 
-// pick the middle tier
+// ── committing a tier ──────────────────────────────────────────────────────
 segs[1].props.onClick()
+await settle()
 check('select() got provider + model + the picked tier',
-  directory.calls.select.length === 1
-  && directory.calls.select[0].provider === 'relay'
-  && directory.calls.select[0].model === 'gpt-6-astra'
-  && directory.calls.select[0].reasoningEffort === 'medium',
-  JSON.stringify(directory.calls.select[0]))
+  state.selectCalls.length === 1
+  && state.selectCalls[0].sessionId === 'session-1'
+  && state.selectCalls[0].provider === 'relay'
+  && state.selectCalls[0].model === 'gpt-6-astra'
+  && state.selectCalls[0].reasoningEffort === 'low',
+  JSON.stringify(state.selectCalls[0]))
+
+const afterPick = await renderWith()
+check('the picked tier becomes the chip label',
+  findByClass(afterPick, 'deu-chipTier')[0]?.props?.children === 'Low',
+  String(findByClass(afterPick, 'deu-chipTier')[0]?.props?.children))
 
 // "follow the model default" drops reasoningEffort entirely
-findByClass(tree, 'deu-reset')[0].props.onClick()
+findByClass(afterPick, 'deu-chip')[0].props.onClick()
+const reopened = await renderWith()
+findByClass(reopened, 'deu-reset')[0].props.onClick()
+await settle()
 check('reset omits reasoningEffort (lets the model default apply)',
-  directory.calls.select.length === 2 && !('reasoningEffort' in directory.calls.select[1]),
-  JSON.stringify(directory.calls.select[1]))
+  state.selectCalls.length === 2 && !('reasoningEffort' in state.selectCalls[1]),
+  JSON.stringify(state.selectCalls[1]))
 
-// ── Host contract edge cases ───────────────────────────────────────────────
-// Each scenario gets a FRESH mount. The component caches the directory snapshot
-// so store writes cannot tear a render; reusing the instance above would show
-// the previous scenario's cached state instead of the new store.
-const cliff = makeDirectory(EFFORTS)
-cliff.snapshot.current = { provider: 'relay', model: 'gpt-6-astra' }   // no explicit choice
-react.freshMount()
-const tree2 = seatRegistration.component({ ...props, directory: cliff.store })
-// The panel is still open from the interactions above, and an open panel
-// replaces the chip — so read the tier label from the panel head.
-const head2 = findByClass(tree2, 'deu-headValue')[0]?.props?.children ?? findByClass(tree2, 'deu-chipTier')[0]?.props?.children
-check('no explicit choice shows the model default label', head2 === '跟随模型默认', String(head2))
-check('no explicit choice is not flagged as the top tier', tree2.props['data-top'] === 'false', String(tree2.props['data-top']))
+const afterReset = await renderWith()
+check('after reset the chip shows the model default label',
+  findByClass(afterReset, 'deu-chipTier')[0]?.props?.children === '跟随模型默认',
+  String(findByClass(afterReset, 'deu-chipTier')[0]?.props?.children))
 
-// A model that EXISTS but declares no reasoning ladder — the real-world case,
-// not "no models at all" (which would leave nothing to render a control for).
-const bare = makeDirectory(EFFORTS)
-bare.snapshot.groups[0].models[0].reasoning = undefined
+// ── a model with a shorter ladder ──────────────────────────────────────────
+state.catalog = makeCatalog(EFFORTS_TWO, {
+  default: { provider: 'relay', model: 'gpt-6-astra', reasoningEffort: 'high' },
+})
 react.freshMount()
-react.keepState()   // reset the hook cursor for the fresh mount
-const treeB0 = seatRegistration.component({ ...props, directory: bare.store })
-findByClass(treeB0, 'deu-chip')[0].props.onClick()
-react.keepState()
-const treeB = seatRegistration.component({ ...props, directory: bare.store })
+const treeShort = await renderWith()
+check('a model declaring two tiers renders two segments after opening',
+  (() => {
+    findByClass(treeShort, 'deu-chip')[0].props.onClick()
+    return true
+  })())
+const treeShortOpen = await renderWith()
+check('ladder length follows the declaration, not a hardcoded count',
+  findByClass(treeShortOpen, 'deu-seg').length === EFFORTS_TWO.length,
+  String(findByClass(treeShortOpen, 'deu-seg').length))
+
+// ── a model with no ladder ─────────────────────────────────────────────────
+state.catalog = makeCatalog(EFFORTS_FOUR, {
+  models: [{ id: 'gpt-6-astra', name: 'GPT-6 Astra' }],
+})
+react.freshMount()
+const treeBare = await renderWith()
+findByClass(treeBare, 'deu-chip')[0].props.onClick()
+const treeBareOpen = await renderWith()
 check('a model with no ladder renders a note, not a broken bar',
-  findByClass(treeB, 'deu-note').length === 1 && findByClass(treeB, 'deu-barWrap').length === 0)
-check('a model with no ladder still shows its name on the chip',
-  findByClass(treeB, 'deu-headValue').length === 1)
+  findByClass(treeBareOpen, 'deu-note').length === 1 && findByClass(treeBareOpen, 'deu-barWrap').length === 0)
 
-// ── regression: the v0.1.0 field failure ──────────────────────────────────
-// v0.1.0 fed `useSyncExternalStore(() => store.getSnapshot())` straight to
-// react-dom. When the real store re-creates its snapshot per call, react-dom
-// sees a change on every render and aborts with React error #185 ("Maximum
-// update depth exceeded"), which is what crashed the seat in the field. The
-// old fake always returned one frozen object, so the suite stayed green.
-const unstable = makeDirectory(EFFORTS, { unstable: true })
-react.keepState()
-const treeU = seatRegistration.component({ ...props, directory: unstable.store })
-check('an unstable store still renders a usable ladder',
-  findByClass(treeU, 'deu-chipTier').length + findByClass(treeU, 'deu-headValue').length > 0)
-check('an unstable store does not re-read the snapshot per render',
-  unstable.calls.snapshot <= 2, `getSnapshot calls: ${unstable.calls.snapshot}`)
+// ── a catalog that fails ───────────────────────────────────────────────────
+state.catalogFails = true
+state.catalog = makeCatalog(EFFORTS_FOUR)
+react.freshMount()
+const treeErr = await renderWith()
+findByClass(treeErr, 'deu-chip')[0].props.onClick()
+const treeErrOpen = await renderWith()
+const errText = findByClass(treeErrOpen, 'deu-error')[0]?.props?.children
+check('a failed catalog surfaces the Host message',
+  typeof errText === 'string' && errText.includes('E_CATALOG'), String(errText))
+state.catalogFails = false
 
-// the injected hook must be preferred when the renderer supplies one
-let hookCalls = 0
-const withHook = {
-  ...props,
-  directory: unstable.store,
-  useModelDirectory: (selector) => { hookCalls += 1; return selector(unstable.snapshot) },
+// ── an addressed-subagent session is read-only, not invisible ─────────────
+// `available` is decided when the seat injects, so the stub has to be re-entered
+// to model a session becoming an addressed subagent.
+state.subagentAddress = { parentSessionId: 'p', childSessionId: 'session-1' }
+state.catalog = makeCatalog(EFFORTS_FOUR)
+const roProps = seatRegistration.options.inject('session-1')
+check('inject marks an addressed-subagent session as read-only', roProps.available === false)
+react.freshMount()
+let treeRO = null
+for (let pass = 0; pass < 6; pass += 1) {
+  react.keepState()
+  treeRO = seatRegistration.component(roProps)
+  react.runEffects()
+  await settle()
 }
 react.keepState()
-const treeH = seatRegistration.component(withHook)
-check('the renderer-injected hook is used when present', hookCalls === 1, `hook calls: ${hookCalls}`)
-check('the injected hook path renders the ladder',
-  findByClass(treeH, 'deu-chipTier').length + findByClass(treeH, 'deu-headValue').length > 0)
-
-// A session that may not CHANGE the selection still has a selection worth
-// showing. The shipped plugin renders nothing there, which is why an addressed
-// subagent session showed an empty composer.
-const ro = makeDirectory(EFFORTS)
-react.freshMount()
-const treeRO = renderCommitted({ ...props, available: false, directory: ro.store })
+treeRO = seatRegistration.component(roProps)
 check('a read-only session still renders the seat',
   treeRO !== null && findByClass(treeRO, 'deu-root').length === 1, String(treeRO))
-check('a read-only seat is not interactive',
-  findByClass(treeRO, 'deu-chip')[0]?.props?.disabled === true)
+// The session may not CHANGE the selection, but it still has one worth showing —
+// so the seat renders, disabled, instead of vanishing the way the shipped
+// model-selection entry does in an addressed subagent session.
+const roChip = findByClass(treeRO, 'deu-chip')[0]
+check('a read-only seat renders but cannot be operated',
+  roChip !== undefined && roChip.props.disabled === true,
+  roChip === undefined ? 'no chip' : String(roChip.props.disabled))
+check('a read-only seat still names the current model',
+  findByClass(treeRO, 'deu-chipModel')[0]?.props?.children === 'GPT-6 Astra',
+  String(findByClass(treeRO, 'deu-chipModel')[0]?.props?.children))
+state.subagentAddress = undefined
 
-// ── teardown leaves nothing behind ─────────────────────────────────────────
+// ── teardown ───────────────────────────────────────────────────────────────
 for (const d of disposers) if (typeof d === 'function') d()
 check('unmount removes the stylesheet', !head.children.some((n) => n.id === 'dsh-effort-ultra-css'))
 
 const failed = results.filter((r) => !r.pass)
-// Restore the real timers before reporting: leaving them synchronous would
-// affect anything Node does afterwards.
 globalThis.setTimeout = realSetTimeout
 globalThis.clearTimeout = realClearTimeout
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`)
@@ -452,4 +419,4 @@ if (failed.length > 0) {
   console.error(`\nFAILED:\n${failed.map((f) => `  - ${f.label}${f.detail === undefined ? '' : ` (${f.detail})`}`).join('\n')}`)
   process.exit(1)
 }
-console.log('smoke-client: OK — native seat registers, renders the Host ladder, commits selections and unmounts clean.')
+console.log('smoke-client: OK — the seat reads the catalog itself, renders the Host ladder, commits tiers and unmounts clean.')
