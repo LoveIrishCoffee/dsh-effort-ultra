@@ -172,19 +172,20 @@ const plugin = registration.factory((name) => {
   throw new Error(`unexpected require(${JSON.stringify(name)})`)
 })
 
-check('plugin declares slots + modelDirectories as hard deps',
-  Array.isArray(plugin.inject) && plugin.inject.includes('slots') && plugin.inject.includes('modelDirectories'),
+check('plugin injects only services that exist at boot',
+  Array.isArray(plugin.inject) && plugin.inject.includes('slots') && !plugin.inject.includes('modelDirectories'),
   JSON.stringify(plugin.inject))
 
 // ── drive apply() with a stub ctx ──────────────────────────────────────────
 const disposers = []
+const serviceListeners = []
 let seatRegistration = null
 const localeDicts = []
 const directory = makeDirectory(EFFORTS)
 
 const ctx = {
-  modelDirectories: { directoryFor: () => directory },
   get: (name) => {
+    if (name === 'modelDirectories') return { directoryFor: () => directory }
     if (name === 'sessions') return { subagentAddress: () => undefined }
     if (name === 'locale') {
       return {
@@ -196,6 +197,7 @@ const ctx = {
     return undefined
   },
   effect: (fn) => { disposers.push(fn()) },
+  on: (name, listener) => { serviceListeners.push({ name, listener }); return () => {} },
   slots: {
     inject: (name, cb) => { cb(); return () => {} },
     register: (options, component) => { seatRegistration = { options, component }; return () => {} },
@@ -208,6 +210,10 @@ const css = head.children.find((n) => n.id === 'dsh-effort-ultra-css')?.textCont
 check('css is balanced', (css.match(/\{/g) || []).length === (css.match(/\}/g) || []).length, `${css.length} chars`)
 check('css avoids foreign class names', !/_3_LLuW_|_7KE1Ra_/.test(css))
 check('locale dictionaries registered', localeDicts.length === 1 && localeDicts[0].ns === 'effort-ultra')
+// The service can appear after this plugin loads. Without this listener the seat
+// would simply never register, with no error to point at.
+check('plugin watches internal/service so a late directory still registers',
+  serviceListeners.some((l) => l.name === 'internal/service'), JSON.stringify(serviceListeners.map((l) => l.name)))
 
 check('seat registered on conversation.input.model',
   seatRegistration?.options?.name === 'conversation.input.model', seatRegistration?.options?.name)
