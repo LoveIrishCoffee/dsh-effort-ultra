@@ -1,7 +1,7 @@
 {
   "name": "dsh-effort-ultra",
-  "version": "0.1.0",
-  "description": "DeepSeek Harness 的原生推理档位控件：composer 里的推理等级档位条，蓝紫渐变 + 星点 + 流光，档位由模型的 reasoning 声明自动决定。 / A native reasoning-effort control for the DSH composer: a blue-to-violet tier bar with a starfield and a sheen sweep, with the ladder taken from each model's own reasoning declaration.",
+  "version": "0.2.0",
+  "description": "DeepSeek Harness composer 的原生推理强度控件：Codex 风格蓝紫渐变界面、连续拖动、模型切换与六档 Step Agent 菜单；档位来自官方 reasoning 声明。 / A native DSH composer reasoning-effort control with a Codex-style blue-to-violet UI, continuous dragging, model switching and a six-tier Step Agent menu driven by the official reasoning declaration.",
   "license": "MIT",
   "author": "LoveIrishCoffee",
   "repository": {

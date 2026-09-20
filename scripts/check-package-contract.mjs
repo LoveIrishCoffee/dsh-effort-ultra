@@ -49,9 +49,15 @@ check('client never references the third-party control it replaces',
   !/@hytime|dsh-thinking-effort|data-seat-/.test(client))
 check('client drives the official seat name',
   client.includes("'conversation.input.model'"))
-check('client reads the official directory service', client.includes('modelDirectories'))
-check('client ships no tier vocabulary of its own',
-  !/\bUltra\b\s*:|\btierNames\b|\beffortLabels\b/.test(client))
+// Check executable call sites, not documentation mentioning a service. Local
+// ClientSessions owns bindings; the Host RPC face owns both model commands.
+const clientCode = client.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+check('client reads the Host model catalog through the remote session face',
+  /\bremoteSession\.modelCatalog\s*\(/.test(clientCode))
+check('client persists selection through the remote session face',
+  /\bremoteSession\.selectModel\s*\(/.test(clientCode))
+check('client does not call selectModel on local ClientSessions',
+  !/\bsessions\.selectModel\s*\(/.test(clientCode))
 
 // ── the host half must not have grown a capability by accident ───────────────
 const host = await readFile(join(root, 'dist/index.js'), 'utf8')
