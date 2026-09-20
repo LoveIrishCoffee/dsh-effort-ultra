@@ -225,8 +225,12 @@ const css = head.children.find((n) => n.id === 'dsh-effort-ultra-css')?.textCont
 check('css is balanced', (css.match(/\{/g) || []).length === (css.match(/\}/g) || []).length, `${css.length} chars`)
 check('css avoids foreign class names', !/_3_LLuW_|_7KE1Ra_/.test(css))
 check('locale dictionaries registered', localeDicts.length === 1 && localeDicts[0].ns === 'effort-ultra')
-check('seat registration waits for a scope declaring remote.session',
-  injectCalls.some((deps) => Array.isArray(deps) && deps.includes('remote.session')), JSON.stringify(injectCalls))
+// The plugin must NEVER defer its apply behind a dependency gate. Declaring
+// `remote`/`remote.session` in `inject`, or waiting on them with `ctx.inject`,
+// parks the whole plugin when they are not registered yet — and a parked plugin
+// never runs apply(), with no error to point at. It reads them with `ctx.get`
+// instead, which takes no inject, and retries on the service announcement.
+check('plugin never defers apply behind a dependency gate', injectCalls.length === 0, JSON.stringify(injectCalls))
 check('seat registered on conversation.input.model',
   seatRegistration?.options?.name === 'conversation.input.model', seatRegistration?.options?.name)
 // The seat must WIN the slot: its catalog retries live inside the component, so
