@@ -415,6 +415,17 @@ check('the renderer-injected hook is used when present', hookCalls === 1, `hook 
 check('the injected hook path renders the ladder',
   findByClass(treeH, 'deu-chipTier').length + findByClass(treeH, 'deu-headValue').length > 0)
 
+// A session that may not CHANGE the selection still has a selection worth
+// showing. The shipped plugin renders nothing there, which is why an addressed
+// subagent session showed an empty composer.
+const ro = makeDirectory(EFFORTS)
+react.freshMount()
+const treeRO = renderCommitted({ ...props, available: false, directory: ro.store })
+check('a read-only session still renders the seat',
+  treeRO !== null && findByClass(treeRO, 'deu-root').length === 1, String(treeRO))
+check('a read-only seat is not interactive',
+  findByClass(treeRO, 'deu-chip')[0]?.props?.disabled === true)
+
 // ── teardown leaves nothing behind ─────────────────────────────────────────
 for (const d of disposers) if (typeof d === 'function') d()
 check('unmount removes the stylesheet', !head.children.some((n) => n.id === 'dsh-effort-ultra-css'))
