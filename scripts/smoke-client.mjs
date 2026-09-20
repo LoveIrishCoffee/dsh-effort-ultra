@@ -211,8 +211,11 @@ check('locale dictionaries registered', localeDicts.length === 1 && localeDicts[
 
 check('seat registered on conversation.input.model',
   seatRegistration?.options?.name === 'conversation.input.model', seatRegistration?.options?.name)
-check('seat priority shadows the default and the third-party control',
-  seatRegistration?.options?.priority === -20, String(seatRegistration?.options?.priority))
+// The seat registers BEHIND the shipped entry (priority 0) on purpose: taking
+// it outright shadows the component whose mount drives the catalog load, which
+// left the directory stuck on "loading". Pinned here so it cannot regress.
+check('seat priority defers to the shipped entry',
+  seatRegistration?.options?.priority === 1, String(seatRegistration?.options?.priority))
 
 // ── render ─────────────────────────────────────────────────────────────────
 const props = seatRegistration.options.inject('session-1')
@@ -251,8 +254,22 @@ const renderCommitted = (overrides = {}) => {
   }
   return tree
 }
-render()
 
+/**
+ * Same as renderCommitted, but for a brand-new seat instance: component-local
+ * refs are dropped first, the way a fresh mount (a new session) starts. Tests
+ * that assert on mount-time decisions must use this, or a previous scenario's
+ * refs leak in.
+ *
+ * @param overrides - props merged over the seat's injected props.
+ * @returns the rendered element tree.
+ */
+const renderFresh = (overrides = {}) => {
+  react.freshMount()
+  return renderCommitted(overrides)
+}
+
+// ── the empty-directory window ─────────────────────────────────────────────
 const findByClass = (node, cls, out = []) => {
   if (node === null || typeof node !== 'object') return out
   if (typeof node.props?.className === 'string' && node.props.className.split(' ').includes(cls)) out.push(node)
@@ -260,6 +277,50 @@ const findByClass = (node, cls, out = []) => {
   for (const kid of Array.isArray(kids) ? kids : [kids]) if (kid !== undefined && kid !== null) findByClass(kid, cls, out)
   return out
 }
+
+// ── the empty-directory window ─────────────────────────────────────────────
+// Runs BEFORE any warm render on purpose. Taking the seat is a one-way latch for
+// an instance (it must not flicker back to the shipped control mid-session), so
+// once a populated render has happened this instance can no longer exhibit the
+// yielding behaviour. The shipped model-selection entry at priority 0 is not
+// just another renderer — mounting it is what drives the shared directory's
+// catalog load — so rendering null here is what keeps that load path alive
+// instead of pinning the seat on "loading" forever.
+const cold = makeDirectory(EFFORTS, { groups: [], current: null, status: 'loading' })
+const coldProps = { ...props, directory: cold.store, load: () => { cold.calls.load += 1 } }
+let treeCold = undefined
+for (let pass = 0; pass < 8; pass += 1) {
+  react.keepState()
+  treeCold = seatRegistration.component(coldProps)
+  react.runEffects()
+  if (treeCold !== null) break
+}
+check('an unloaded directory renders nothing, yielding the seat',
+  treeCold === null, String(treeCold))
+check('mounting the seat asks the directory to load',
+  cold.calls.load >= 1, `load calls: ${cold.calls.load}`)
+// The catalog loader runs once in a constructor and swallows its failure, so a
+// transient startup failure would otherwise pin the seat on "loading" forever.
+check('a directory stuck in loading is retried, not abandoned',
+  cold.calls.load > 1 && cold.calls.load <= 8, `load calls: ${cold.calls.load}`)
+
+// …and once the directory carries data, the same instance takes the seat over.
+cold.snapshot.groups = [{
+  id: 'relay',
+  name: 'Relay',
+  models: [{ id: 'gpt-6-astra', name: 'GPT-6 Astra', reasoning: { defaultEffort: 'high', efforts: EFFORTS } }],
+}]
+cold.snapshot.current = { provider: 'relay', model: 'gpt-6-astra', reasoningEffort: 'ultra' }
+cold.snapshot.status = 'ready'
+react.keepState()
+const treeWarm = seatRegistration.component(coldProps)
+react.runEffects()
+check('once the directory is populated the seat renders its own control',
+  treeWarm !== null && findByClass(treeWarm, 'deu-root').length === 1)
+
+// A fresh mount for the remaining scenarios: this instance has now latched.
+react.freshMount()
+render()
 
 check('chip renders with the model label', findByClass(tree, 'deu-chipModel')[0]?.props?.children === 'GPT-6 Astra')
 check('chip shows the current tier name', findByClass(tree, 'deu-chipTier')[0]?.props?.children === 'Ultra')
@@ -347,31 +408,6 @@ const treeH = seatRegistration.component(withHook)
 check('the renderer-injected hook is used when present', hookCalls === 1, `hook calls: ${hookCalls}`)
 check('the injected hook path renders the ladder',
   findByClass(treeH, 'deu-chipTier').length + findByClass(treeH, 'deu-headValue').length > 0)
-
-// ── the empty-directory window ─────────────────────────────────────────────
-// A directory starts at `{ current: null, groups: [], status: 'loading' }`, so
-// the first render has nothing to label the chip with. v0.1.0 shipped a bare
-// chevron in that window, which reads as a broken control.
-const cold = makeDirectory(EFFORTS, { groups: [], current: null, status: 'loading' })
-react.freshMount()
-// `load` is a closure over one directory, so a test that swaps the store must
-// swap the loader with it — otherwise the counter records the load on the
-// original directory and the assertion reads a stale zero.
-const treeCold = renderCommitted({
-  directory: cold.store,
-  load: () => { cold.calls.load += 1 },
-})
-const coldLabel = findByClass(treeCold, 'deu-chipModel')[0]?.props?.children
-check('an unloaded directory shows placeholder copy, not an empty chip',
-  typeof coldLabel === 'string' && coldLabel.length > 0, JSON.stringify(coldLabel))
-check('an unloaded directory still renders the chevron',
-  findByClass(treeCold, 'deu-chevron').length === 1)
-check('mounting the seat asks the directory to load',
-  cold.calls.load >= 1, `load calls: ${cold.calls.load}`)
-// The catalog loader runs once in a constructor and swallows its failure, so a
-// transient startup failure would otherwise pin the seat on "loading" forever.
-check('a directory stuck in loading is retried, not abandoned',
-  cold.calls.load > 1 && cold.calls.load <= 6, `load calls: ${cold.calls.load}`)
 
 // ── teardown leaves nothing behind ─────────────────────────────────────────
 for (const d of disposers) if (typeof d === 'function') d()
